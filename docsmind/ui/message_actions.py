@@ -1,0 +1,123 @@
+"""Small reusable controls for chat messages."""
+
+from __future__ import annotations
+
+import html
+import json
+
+import streamlit as st
+
+from docsmind.config.settings import get_settings
+from docsmind.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+_COPY_HTML = (
+    '<button id="copy" type="button" title="Copy" '
+    'aria-label="Copy message">Copy</button>'
+    '<span id="status" role="status" aria-live="polite"></span>'
+)
+_COPY_CSS = """
+button { border:0; background:transparent; color:#777; cursor:pointer;
+  font:12px system-ui; padding:2px 6px; border-radius:6px; }
+button:hover { background:rgba(127,127,127,.12); color:#333; }
+#status { color:#56845f; font:11px system-ui; margin-left:4px; }
+"""
+_COPY_JS = """
+export default function(component) {
+  const { data, parentElement } = component;
+  const button = parentElement.querySelector('#copy');
+  const status = parentElement.querySelector('#status');
+  const copy = async () => {
+    const text = typeof data?.text === 'string' ? data.text : '';
+    try {
+      await navigator.clipboard.writeText(text);
+      status.textContent = 'Copied';
+    } catch (_) {
+      const area = document.createElement('textarea');
+      area.value = text; parentElement.appendChild(area); area.select();
+      document.execCommand('copy'); area.remove(); status.textContent = 'Copied';
+    }
+    setTimeout(() => { status.textContent = ''; }, 1400);
+  };
+  button.addEventListener('click', copy);
+  return () => button.removeEventListener('click', copy);
+}
+"""
+
+
+def _register_copy_component():
+    return st.components.v2.component(
+        "docsmind_copy_button",
+        html=_COPY_HTML,
+        css=_COPY_CSS,
+        js=_COPY_JS,
+    )
+
+
+_COPY_COMPONENT = _register_copy_component()
+
+
+def copy_component_html(text: str, component_id: str = "copy_message") -> str:
+    """Build an isolated clipboard button without exposing hidden metadata."""
+    payload = json.dumps(text, ensure_ascii=False).replace("<", "\\u003c")
+    safe_id = html.escape(component_id, quote=True)
+    return f"""<!doctype html>
+<html><body data-component-id="{safe_id}" style="margin:0;background:transparent">
+<button id="copy" type="button" title="Copy" aria-label="Copy message">Copy</button>
+<span id="status" role="status" aria-live="polite"></span>
+<script>
+const text = {payload};
+const button = document.getElementById('copy');
+const status = document.getElementById('status');
+button.addEventListener('click', async () => {{
+  try {{
+    await navigator.clipboard.writeText(text);
+    status.textContent = 'Copied';
+  }} catch (_) {{
+    const area = document.createElement('textarea');
+    area.value = text; document.body.appendChild(area); area.select();
+    document.execCommand('copy'); area.remove(); status.textContent = 'Copied';
+  }}
+  setTimeout(() => status.textContent = '', 1400);
+}});
+</script>
+<style>
+button {{ border:0; background:transparent; color:#777; cursor:pointer;
+  font:12px system-ui; padding:2px 6px; border-radius:6px; }}
+button:hover {{ background:rgba(127,127,127,.12); color:#333; }}
+#status {{ color:#56845f; font:11px system-ui; margin-left:4px; }}
+</style></body></html>"""
+
+
+def render_copy_button(*, text: str, key: str) -> None:
+    global _COPY_COMPONENT
+    kwargs = {
+        "key": key,
+        "data": {"text": text},
+        "width": "content",
+        "height": "content",
+    }
+    try:
+        _COPY_COMPONENT(**kwargs)
+    except ValueError as exc:
+        # AppTest and a Streamlit hot reload can replace the component registry
+        # while this module object survives. Re-register once in that context.
+        if "is not registered" not in str(exc):
+            raise
+        _COPY_COMPONENT = _register_copy_component()
+        _COPY_COMPONENT(**kwargs)
+    if get_settings().debug_generation:
+        logger.info(
+            "Generation lifecycle stage=clipboard component_id=%s clipboard_chars=%d",
+            key,
+            len(text),
+        )
+
+
+def action_key(action: str, message_id: str) -> str:
+    """Stable collision-free Streamlit key for a message action."""
+    return f"{action}_{html.escape(message_id, quote=True)}"
+
+
+__all__ = ["action_key", "copy_component_html", "render_copy_button"]

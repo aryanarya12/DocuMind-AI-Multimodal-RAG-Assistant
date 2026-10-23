@@ -1,0 +1,55 @@
+"""LLM provider adapters and the failover router.
+
+The application always talks to :func:`get_llm_provider`, which returns a
+:class:`~docsmind.providers.llm.router.FallbackLLMProvider` wrapping the
+configured chain (Gemini → Groq → OpenRouter by default).
+"""
+
+from docsmind.providers.llm.anthropic import AnthropicLLM
+from docsmind.providers.llm.base import (
+    BaseLLMProvider,
+    ImagePart,
+    LLMMessage,
+    LLMRequestRequirements,
+    LLMResponse,
+)
+from docsmind.providers.llm.factory import (
+    SUPPORTED_PROVIDERS,
+    build_endpoint_provider,
+    build_llm_provider,
+    get_llm_provider,
+    reset_llm_cache,
+)
+from docsmind.providers.llm.gemini import GeminiLLM
+from docsmind.providers.llm.groq import GroqLLM
+from docsmind.providers.llm.mock import MockLLM
+from docsmind.providers.llm.openai_compat import OpenAICompatibleLLM
+from docsmind.providers.llm.openrouter import OpenRouterLLM, model_supports_images
+from docsmind.providers.llm.router import (
+    FallbackLLMProvider,
+    ProviderAttempt,
+    RouterStats,
+)
+
+__all__ = [
+    "AnthropicLLM",
+    "BaseLLMProvider",
+    "FallbackLLMProvider",
+    "GeminiLLM",
+    "GroqLLM",
+    "ImagePart",
+    "LLMMessage",
+    "LLMRequestRequirements",
+    "LLMResponse",
+    "MockLLM",
+    "OpenAICompatibleLLM",
+    "OpenRouterLLM",
+    "ProviderAttempt",
+    "RouterStats",
+    "SUPPORTED_PROVIDERS",
+    "build_endpoint_provider",
+    "build_llm_provider",
+    "get_llm_provider",
+    "model_supports_images",
+    "reset_llm_cache",
+]

@@ -1,0 +1,397 @@
+"""Main panel: welcome state, conversation, answers, citations."""
+
+from __future__ import annotations
+
+import html
+import uuid
+from typing import List, Optional
+
+import streamlit as st
+
+from docsmind.core.enums import Role
+from docsmind.core.models import ChatMessage
+from docsmind.services.chat_service import ChatRequest
+from docsmind.services.chat_history import apply_regeneration, plan_regeneration
+from docsmind.ui import state
+from docsmind.ui.message_actions import action_key, render_copy_button
+from docsmind.ui.components import (
+    caption,
+    provider_badge,
+    render_error,
+    rtl_markdown,
+)
+from docsmind.ui.sources import render_sources
+from docsmind.utils.logging import get_logger
+from docsmind.utils.user_messages import (
+    SERVICE_NOT_CONFIGURED,
+    public_error_text,
+    public_generation_warning,
+)
+
+logger = get_logger(__name__)
+
+FEATURES = [
+    ("📄", "Any document", "PDF, scans, Word, PowerPoint, images, Markdown and text."),
+    ("👁️", "Sees the visuals", "Charts, diagrams, tables and handwriting — not just extracted text."),
+    ("🌍", "Arabic & English", "Ask in one language, search documents written in the other."),
+    ("🔎", "Cited answers", "Every claim links back to a file, page and passage."),
+]
+
+FALLBACK_PROMPTS = [
+    "Summarize these documents.",
+    "What are the key findings?",
+    "Explain the charts and diagrams.",
+    "لخّص هذه المستندات بالعربية.",
+]
+
+
+def render() -> None:
+    """Draw the main panel."""
+    interrupted = state.recover_interrupted_generation()
+    history = state.messages()
+    documents = state.ready_documents()
+    action_error = state.take_action_error()
+    if action_error:
+        st.error(public_error_text(
+            action_error, debug=state.settings().debug_generation
+        ))
+    if interrupted:
+        st.warning(
+            "The previous generation was interrupted by an app rerun. No partial "
+            "assistant answer was saved; use Regenerate to retry the prompt."
+        )
+
+    if not history:
+        _render_welcome(bool(documents))
+
+    for index, message in enumerate(history):
+        _render_message(message, index)
+
+    _handle_input(bool(documents))
+
+
+# --------------------------------------------------------------------------- #
+def _render_welcome(has_documents: bool) -> None:
+    st.markdown(
+        """
+        <div class="omni-hero">
+          <h1>Chat with your documents</h1>
+          <p>Upload PDFs, scans, Word files, slide decks or images — then ask
+          anything. DocsMind reads the text <em>and</em> the visuals, and cites
+          every answer.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not has_documents:
+        columns = st.columns(4, gap="small")
+        for column, (icon, title, body) in zip(columns, FEATURES):
+            with column:
+                st.markdown(
+                    f"""
+                    <div class="omni-feature">
+                      <div class="omni-feature-title">{icon} {html.escape(title)}</div>
+                      <div class="omni-feature-body">{html.escape(body)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        st.write("")
+        st.info("Upload a document in the sidebar to get started.", icon="👈")
+        return
+
+    _render_example_prompts()
+
+
+def _render_example_prompts() -> None:
+    try:
+        prompts = state.chat_service().suggested_prompts(state.session_id())
+    except Exception as exc:
+        logger.debug("Could not build suggested prompts: %s", exc)
+        prompts = []
+    prompts = prompts or FALLBACK_PROMPTS
+
+    st.markdown("###### Try asking")
+    columns = st.columns(2, gap="small")
+    for index, prompt in enumerate(prompts[:6]):
+        with columns[index % 2]:
+            if st.button(prompt, key=f"example_{index}", width="stretch"):
+                state.set_pending_prompt(prompt)
+                st.rerun()
+
+
+# --------------------------------------------------------------------------- #
+def _render_message(message: ChatMessage, index: int) -> None:
+    avatar = "🧑" if message.role == Role.USER else "🔷"
+    with st.chat_message(message.role.value, avatar=avatar):
+        if message.role == Role.USER and state.editing_message_id() == message.message_id:
+            _render_editor(message)
+            return
+        if message.error:
+            render_error(public_error_text(
+                message.content,
+                debug=state.settings().debug_generation,
+            ))
+        else:
+            if state.settings().debug_generation:
+                message.debug["rendered_chars"] = len(message.content)
+                logger.info(
+                    "Generation lifecycle stage=render generation_id=%s message_id=%s "
+                    "render_chars=%d finish_reason=%s",
+                    message.debug.get("generation_id", ""),
+                    message.message_id,
+                    len(message.content),
+                    message.debug.get("finish_reason", "unspecified"),
+                )
+            rtl_markdown(message.content)
+
+        if message.role == Role.USER:
+            _render_user_actions(message)
+            return
+
+        if message.citations:
+            render_sources(
+                message.citations,
+                used_indices=_used_indices(message),
+                file_store=state.engine().file_store,
+                key_prefix=f"m{index}",
+                retrieval=message.retrieval,
+                show_diagnostics=state.settings().debug_generation,
+            )
+
+        _render_message_footer(message)
+        _render_assistant_actions(message)
+
+
+def _render_user_actions(message: ChatMessage) -> None:
+    columns = st.columns([0.34, 0.18, 0.22, 0.26], gap="small")
+    with columns[0]:
+        render_copy_button(
+            text=message.content, key=action_key("copy_user", message.message_id)
+        )
+    with columns[1]:
+        if st.button(
+            "Edit",
+            key=action_key("edit_user", message.message_id),
+            help="Edit this prompt",
+        ):
+            state.set_editing_message(message.message_id)
+            st.rerun()
+    with columns[2]:
+        if st.button(
+            "Regenerate",
+            key=action_key("regen_user", message.message_id),
+            help="Resend this prompt and replace later turns",
+        ):
+            _regenerate(message.message_id)
+
+
+def _render_assistant_actions(message: ChatMessage) -> None:
+    columns = st.columns([0.34, 0.24, 0.42], gap="small")
+    with columns[0]:
+        render_copy_button(
+            text=message.content,
+            key=action_key("copy_assistant", message.message_id),
+        )
+    with columns[1]:
+        if st.button(
+            "Regenerate",
+            key=action_key("regen_assistant", message.message_id),
+            help="Regenerate this answer from its preceding prompt",
+        ):
+            _regenerate(message.message_id)
+
+
+def _render_editor(message: ChatMessage) -> None:
+    edited = st.text_area(
+        "Edit message",
+        value=message.content,
+        key=action_key("edit_text", message.message_id),
+        label_visibility="collapsed",
+    )
+    cancel, save, _ = st.columns([0.18, 0.32, 0.5], gap="small")
+    with cancel:
+        if st.button(
+            "Cancel",
+            key=action_key("cancel_edit", message.message_id),
+            help="Cancel editing",
+        ):
+            state.set_editing_message(None)
+            st.rerun()
+    with save:
+        if st.button(
+            "Save & Regenerate",
+            key=action_key("save_edit", message.message_id),
+            help="Save this prompt and regenerate from this point",
+        ):
+            _regenerate(message.message_id, edited_text=edited)
+
+
+def _regenerate(message_id: str, *, edited_text: Optional[str] = None) -> None:
+    """Run a complete new RAG turn, committing history only on success."""
+    current = list(state.messages())
+    try:
+        plan = plan_regeneration(current, message_id, edited_text=edited_text)
+        generation_id = uuid.uuid4().hex
+        state.begin_generation(generation_id, plan.user_message_id)
+        with st.spinner("Searching your documents again…"):
+            answer = state.chat_service().answer(
+                ChatRequest(
+                    question=plan.prompt,
+                    session_id=state.session_id(),
+                    document_ids=state.selected_document_ids(),
+                    history=plan.history,
+                    user_message_id=plan.user_message_id,
+                    generation_id=generation_id,
+                )
+            )
+        if answer.error:
+            state.set_action_error(answer.content)
+        else:
+            state.replace_messages(apply_regeneration(current, plan, answer))
+            state.set_editing_message(None)
+        state.complete_generation()
+    except Exception as exc:  # noqa: BLE001 - preserve the valid old turn
+        logger.exception("Message regeneration failed")
+        state.set_action_error("Could not regenerate this message. Please try again.")
+    st.rerun()
+
+
+def _render_message_footer(message: ChatMessage) -> None:
+    debug = message.debug or {}
+    diagnostic_mode = state.settings().debug_generation
+    warnings: List[str] = list(debug.get("warnings") or [])
+    for warning in warnings:
+        public_warning = public_generation_warning(warning, debug=diagnostic_mode)
+        if public_warning:
+            st.warning(public_warning, icon="⚠️")
+
+    if not debug:
+        return
+
+    if diagnostic_mode:
+        provider_badge(
+            str(debug.get("provider", "")),
+            str(debug.get("model", "")),
+            fallback_used=_used_fallback(debug),
+        )
+
+    bits = []
+    if debug.get("contexts"):
+        bits.append(f"{debug['contexts']} sources")
+    if debug.get("images_sent"):
+        count = int(debug["images_sent"])
+        bits.append(f"{count} image{'s' if count != 1 else ''} analysed")
+    if debug.get("elapsed_s"):
+        bits.append(f"{debug['elapsed_s']}s")
+    if bits:
+        caption(" · ".join(bits))
+
+    if diagnostic_mode:
+        with st.expander("Generation diagnostics", expanded=False):
+            st.json(_generation_debug_payload(message), expanded=False)
+
+
+def _generation_debug_payload(message: ChatMessage) -> dict:
+    debug = message.debug or {}
+    return {
+        "Revision": getattr(state.engine(), "revision", "unknown"),
+        "Generation ID": debug.get("generation_id", ""),
+        "Message ID": message.message_id,
+        "Provider": debug.get("provider", ""),
+        "Model": debug.get("model", ""),
+        "Query scope": debug.get("query_scope", "FOCUSED"),
+        "Requested output tokens": debug.get("requested_output_tokens")
+        or debug.get("requested_max_output_tokens"),
+        "Finish reason": debug.get("finish_reason", ""),
+        "Raw chars": debug.get("provider_raw_chars"),
+        "Parsed chars": debug.get("parsed_chars"),
+        "Stored chars": len(message.content),
+        "Rendered chars": debug.get("rendered_chars", len(message.content)),
+        "Continuation count": debug.get("continuation_count", 0),
+    }
+
+
+def _used_fallback(debug: dict) -> bool:
+    attempts = debug.get("provider_attempts") or []
+    return len(attempts) > 1 or bool(debug.get("openrouter_free_fallback"))
+
+
+def _used_indices(message: ChatMessage) -> set:
+    from docsmind.rag.citations import parse_markers
+
+    valid = {c.index for c in message.citations}
+    return {i for i in parse_markers(message.content) if i in valid}
+
+
+# --------------------------------------------------------------------------- #
+def _handle_input(has_documents: bool) -> None:
+    settings = state.settings()
+    placeholder = (
+        "Ask anything about your documents…"
+        if has_documents
+        else "Upload a document first…"
+    )
+
+    typed = st.chat_input(placeholder, disabled=not has_documents)
+    prompt = typed or state.take_pending_prompt()
+
+    if not prompt:
+        return
+    if not has_documents:
+        return
+    if not settings.llm.is_configured:
+        st.error(SERVICE_NOT_CONFIGURED)
+        return
+
+    user_message = ChatMessage(role=Role.USER, content=prompt)
+    state.add_message(user_message)
+    generation_id = uuid.uuid4().hex
+    state.begin_generation(generation_id, user_message.message_id)
+
+    with st.chat_message("user", avatar="🧑"):
+        rtl_markdown(prompt)
+
+    with st.chat_message("assistant", avatar="🔷"):
+        with st.spinner("Searching your documents…"):
+            answer = _answer(prompt, user_message.message_id, generation_id)
+    if state.settings().debug_generation:
+        logger.info(
+            "Generation lifecycle stage=pre_storage generation_id=%s message_id=%s "
+            "chat_message_chars=%d finish_reason=%s",
+            generation_id,
+            answer.message_id,
+            len(answer.content),
+            answer.debug.get("finish_reason", "unspecified"),
+        )
+    state.add_message(answer)
+    state.complete_generation()
+    st.rerun()
+
+
+def _answer(
+    prompt: str,
+    user_message_id: Optional[str] = None,
+    generation_id: str = "",
+) -> ChatMessage:
+    service = state.chat_service()
+    history = [m for m in state.messages() if m.role in (Role.USER, Role.ASSISTANT)][:-1]
+    try:
+        return service.answer(
+            ChatRequest(
+                question=prompt,
+                session_id=state.session_id(),
+                document_ids=state.selected_document_ids(),
+                history=history,
+                user_message_id=user_message_id,
+                generation_id=generation_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - the UI must never crash
+        logger.exception("Unhandled error while answering")
+        message = "Something went wrong while answering. Please try again."
+        return ChatMessage(role=Role.ASSISTANT, content=message, error=message)
+
+
+__all__ = ["render"]
